@@ -206,6 +206,19 @@ function markAsFailed(convPath: string): void {
   } catch {}
 }
 
+function isExtractionArtifact(convPath: string): boolean {
+  try {
+    const firstLine = readFileSync(convPath, 'utf-8').trim().split('\n')[0];
+    const entry = JSON.parse(firstLine);
+    const text = extractTextFromContent(entry?.message?.content ?? '');
+    return text.includes('Extract ONLY what actually happened') ||
+           text.includes('expert at extracting meaningful, factual information') ||
+           text.includes('## ONE SENTENCE SUMMARY');
+  } catch {
+    return false;
+  }
+}
+
 // ─── Topic extraction ──────────────────────────────────────────────
 
 function extractTopics(fabricOutput: string): string[] {
@@ -262,6 +275,7 @@ Full archive: DISTILLED.md
     }
   }
 
+  sections = sections.filter(s => !s.startsWith(`## Extracted: ${timestamp} | ${sessionLabel}`));
   sections.unshift(`## Extracted: ${timestamp} | ${sessionLabel}\n\n${extracted.trim()}\n`);
   sections = sections.slice(0, HOT_RECALL_MAX_SESSIONS);
 
@@ -313,9 +327,21 @@ function appendRejections(fabricOutput: string, sessionLabel: string, timestamp:
     .filter(l => l.length > 5);
   if (lines.length === 0) return;
 
-  const entries = lines.map(l => `${timestamp}|${sessionLabel}|${l.replace(/\|/g, '/')}`);
-  appendFileSync(REJECTIONS_PATH, entries.join('\n') + '\n', 'utf-8');
-  console.error(`[SessionExtract] Appended ${entries.length} rejections`);
+  const normalize = (s: string) => s.toLowerCase().replace(/['"]/g, '').replace(/\s+/g, ' ').trim();
+  const existing = new Set<string>();
+  if (existsSync(REJECTIONS_PATH)) {
+    for (const line of readFileSync(REJECTIONS_PATH, 'utf-8').split('\n')) {
+      const parts = line.split('|');
+      if (parts.length >= 3) existing.add(normalize(parts.slice(2).join('|')));
+    }
+  }
+  const newEntries = lines
+    .filter(l => !existing.has(normalize(l)))
+    .map(l => `${timestamp}|${sessionLabel}|${l.replace(/\|/g, '/')}`);
+  if (newEntries.length > 0) {
+    appendFileSync(REJECTIONS_PATH, newEntries.join('\n') + '\n', 'utf-8');
+    console.error(`[SessionExtract] Appended ${newEntries.length} rejections`);
+  }
 }
 
 function appendErrors(fabricOutput: string, sessionLabel: string, timestamp: string): void {
@@ -550,8 +576,13 @@ async function extractAndAppend(conversationPath: string, cwd: string): Promise<
       const topics = extractTopics(extracted);
       const summary = summaryMatch ? summaryMatch[1].trim() : `${dirName} session`;
 
-      // Append to DISTILLED.md (full archive)
-      appendFileSync(DISTILLED_PATH, `\n\n## Extracted: ${timestamp} | ${dirName}\n\n${extracted.trim()}\n\n---\n`, 'utf-8');
+      // Append to DISTILLED.md (full archive) — guard against duplicate session entries
+      const existingDistilled = existsSync(DISTILLED_PATH) ? readFileSync(DISTILLED_PATH, 'utf-8') : '';
+      if (!existingDistilled.includes(`<!-- session:${sessionId} -->`)) {
+        appendFileSync(DISTILLED_PATH, `\n\n## Extracted: ${timestamp} | ${dirName} <!-- session:${sessionId} -->\n\n${extracted.trim()}\n\n---\n`, 'utf-8');
+      } else {
+        console.error(`[SessionExtract] DISTILLED: skipping duplicate ${sessionId}`);
+      }
 
       // Update HOT_RECALL.md (last N sessions)
       updateHotRecall(extracted, dirName, timestamp);
@@ -611,11 +642,16 @@ async function writeToDb(extracted: string, project: string, date: string, sessi
   const db = await openHookDb();
 
   try {
-    // 1. Insert LoA entry
-    await db.run(
-      `INSERT INTO loa_entries (created_at, title, fabric_extract, session_id, project) VALUES (?, ?, ?, ?, ?)`,
-      [date, title, extracted, sessionId, project]
-    );
+    // 1. Insert LoA entry (skip if session already recorded)
+    const existingLoa = await db.queryOne<{ id: number }>('SELECT id FROM loa_entries WHERE session_id = ?', [sessionId]);
+    if (!existingLoa) {
+      await db.run(
+        `INSERT INTO loa_entries (created_at, title, fabric_extract, session_id, project) VALUES (?, ?, ?, ?, ?)`,
+        [date, title, extracted, sessionId, project]
+      );
+    } else {
+      console.error(`[SessionExtract] DB loa_entries: skipping duplicate session_id ${sessionId}`);
+    }
 
     // 2. Extract and insert decisions
     const decisionsMatch = extracted.match(/(?:##\s*DECISIONS\s*MADE|DECISIONS:)\s*([\s\S]*?)(?=\n##\s|$)/);
@@ -630,10 +666,15 @@ async function writeToDb(extracted: string, project: string, date: string, sessi
         const decision = rejectPlaceholder(parts[0].trim());
         if (!decision) continue;
         const reasoning = parts.length > 1 ? rejectPlaceholder(parts.slice(1).join(':').trim()) : null;
-        await db.run(
-          `INSERT INTO decisions (created_at, session_id, project, decision, reasoning) VALUES (?, ?, ?, ?, ?)`,
-          [date, sessionId, project, decision, reasoning]
+        const existingDecision = await db.queryOne<{ id: number }>(
+          'SELECT id FROM decisions WHERE session_id = ? AND decision = ?', [sessionId, decision]
         );
+        if (!existingDecision) {
+          await db.run(
+            `INSERT INTO decisions (created_at, session_id, project, decision, reasoning) VALUES (?, ?, ?, ?, ?)`,
+            [date, sessionId, project, decision, reasoning]
+          );
+        }
       }
     }
 
@@ -719,6 +760,12 @@ if (process.argv.includes('--batch')) {
           delete tracker[conv.path];
           saveExtractionTracker(tracker);
         } catch {}
+      }
+
+      if (isExtractionArtifact(conv.path)) {
+        markAsExtracted(conv.path);
+        skipped++;
+        continue;
       }
 
       if (!force && wasAlreadyExtracted(conv.path)) {
