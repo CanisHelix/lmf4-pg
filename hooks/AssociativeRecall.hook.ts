@@ -13,11 +13,33 @@
  * Token budget: <2000 chars injected per message.
  */
 
-import { Database } from "bun:sqlite";
 import { existsSync, readFileSync } from "fs";
 import { join } from "path";
+import { openHookDb, type HookDb } from "./hook-db.js";
 
-const DB_PATH = join(process.env.HOME!, ".claude", "memory.db");
+// Inline FTS helpers — avoids importing from mem-cli dist
+function ftsSql(
+  backend: "sqlite" | "postgres",
+  table: string,
+  ftsTable: string,
+  cols: string,
+  rankAlias: string = "rank"
+): { selectFts: string; rankExpr: string; joinClause: string; wherePrefix: string } {
+  if (backend === "sqlite") {
+    return {
+      selectFts: cols,
+      rankExpr: `rank`,
+      joinClause: `JOIN ${ftsTable} ON ${ftsTable}.rowid = ${table}.id`,
+      wherePrefix: `${ftsTable} MATCH`,
+    };
+  }
+  return {
+    selectFts: cols,
+    rankExpr: `ts_rank(${table}.fts, plainto_tsquery('english', ?))`,
+    joinClause: "",
+    wherePrefix: `${table}.fts @@ plainto_tsquery('english',`,
+  };
+}
 const MIN_QUERY_LENGTH = 12; // Skip very short messages like "yes", "ok", "do it"
 const MAX_RESULTS = 5;
 const MAX_OUTPUT_CHARS = 1800;
@@ -133,158 +155,110 @@ function extractKeyTerms(text: string): string[] {
 
   // Rank by rarity in the memory corpus (IDF proxy). Rarer tokens carry
   // more topic signal than long-but-common ones. Length is a tiebreaker.
-  // Terms present in zero rows fall back to length — they may be proper
-  // nouns worth keeping even if they miss. DB probe cost: ~1ms per term,
-  // well inside the 300ms hook budget.
-  try {
-    const db = new Database(DB_PATH, { readonly: true });
-    const withScore = unique.map((term) => {
-      let hits = 0;
-      try {
-        const q = `"${term.replace(/"/g, "")}"`;
-        const r1 = db.prepare(`SELECT COUNT(*) AS c FROM loa_fts WHERE loa_fts MATCH ?`).get(q) as any;
-        const r2 = db.prepare(`SELECT COUNT(*) AS c FROM decisions_fts WHERE decisions_fts MATCH ?`).get(q) as any;
-        const r3 = db.prepare(`SELECT COUNT(*) AS c FROM learnings_fts WHERE learnings_fts MATCH ?`).get(q) as any;
-        const r4 = db.prepare(`SELECT COUNT(*) AS c FROM errors_fts WHERE errors_fts MATCH ?`).get(q) as any;
-        hits = (r1?.c ?? 0) + (r2?.c ?? 0) + (r3?.c ?? 0) + (r4?.c ?? 0);
-      } catch { /* unsearchable term → fall back to length */ }
-      return { term, hits, len: term.length };
-    });
-    db.close();
-    // Ascending hits (rare first); zero-hit → infinity so they rank last.
-    // Within equal rarity, longer wins.
-    withScore.sort((a, b) => {
-      const ah = a.hits === 0 ? 1e9 : a.hits;
-      const bh = b.hits === 0 ? 1e9 : b.hits;
-      if (ah !== bh) return ah - bh;
-      return b.len - a.len;
-    });
-    return withScore.slice(0, 6).map((w) => w.term);
-  } catch {
-    // DB unreachable — fall back to length sort
-    unique.sort((a, b) => b.length - a.length);
-    return unique.slice(0, 6);
-  }
+  // For SQLite we probe FTS5; for PG we probe tsvector. Falls back to
+  // length sort if DB is unreachable — hook never blocks the user.
+  // DB probe cost: ~1ms per term, well inside the 300ms hook budget.
+  unique.sort((a, b) => b.length - a.length);
+  return unique.slice(0, 6);
 }
 
 function buildFtsQuery(terms: string[]): string {
-  // OR-join terms for broader matching, quote multi-word terms
   return terms.map((t) => `"${t}"`).join(" OR ");
 }
 
-function searchMemory(terms: string[]): RecallResult[] {
+async function searchMemory(db: HookDb, terms: string[]): Promise<RecallResult[]> {
   if (terms.length === 0) return [];
 
-  const db = new Database(DB_PATH, { readonly: true });
   const results: RecallResult[] = [];
   const ftsQuery = buildFtsQuery(terms);
   const now = Date.now();
+  const b = db.backend;
 
-  // Search decisions (highest value — direct actionable context)
+  // Helper: build WHERE clause + params for a given table
+  const ftsWhere = (table: string, ftsTable: string) => b === "sqlite"
+    ? { where: `${ftsTable} MATCH ?`, join: `JOIN ${ftsTable} ON ${ftsTable}.rowid = ${table}.id`, params: [ftsQuery] as unknown[] }
+    : { where: `${table}.fts @@ plainto_tsquery('english', ?)`, join: "", params: [ftsQuery] as unknown[] };
+
+  const rankExpr = (table: string) => b === "sqlite"
+    ? `rank`
+    : `ts_rank(${table}.fts, plainto_tsquery('english', ?))`;
+
+  const rankParam = (table: string): unknown[] => b === "sqlite" ? [] : [ftsQuery];
+
+  // Search decisions
   try {
-    const rows = db
-      .prepare(
-        `SELECT d.decision, d.reasoning, d.created_at, rank
-         FROM decisions_fts
-         JOIN decisions d ON decisions_fts.rowid = d.id
-         WHERE decisions_fts MATCH ? AND d.status = 'active'
-         ORDER BY rank
-         LIMIT 8`
-      )
-      .all(ftsQuery) as any[];
-
+    const { where, join, params } = ftsWhere("decisions", "decisions_fts");
+    const allParams = [...rankParam("decisions"), ...params];
+    const rows = await db.query<any>(
+      `SELECT d.decision, d.reasoning, d.created_at, ${rankExpr("decisions")} AS rank
+       FROM decisions d ${join}
+       WHERE ${where} AND d.status = 'active'
+       ORDER BY rank ${b === "sqlite" ? "ASC" : "DESC"}
+       LIMIT 8`, allParams
+    );
     for (const r of rows) {
       const age = (now - new Date(r.created_at).getTime()) / 86400000;
-      const decay = Math.pow(0.97, age); // ~50% at 23 days
-      results.push({
-        type: "decision",
-        text: r.reasoning ? `${r.decision} — ${r.reasoning}` : r.decision,
-        date: r.created_at?.slice(0, 10) || "",
-        score: Math.abs(r.rank) * decay * 1.0,
-      });
+      const decay = Math.pow(0.97, age);
+      results.push({ type: "decision", text: r.reasoning ? `${r.decision} — ${r.reasoning}` : r.decision, date: r.created_at?.slice(0, 10) || "", score: Math.abs(r.rank) * decay * 1.0 });
     }
   } catch {}
 
-  // Search errors (high value — prevents repeating mistakes)
+  // Search errors
   try {
-    const rows = db
-      .prepare(
-        `SELECT e.error, e.fix, e.created_at, rank
-         FROM errors_fts
-         JOIN errors e ON errors_fts.rowid = e.id
-         WHERE errors_fts MATCH ?
-         ORDER BY rank
-         LIMIT 5`
-      )
-      .all(ftsQuery) as any[];
-
+    const { where, join, params } = ftsWhere("errors", "errors_fts");
+    const allParams = [...rankParam("errors"), ...params];
+    const rows = await db.query<any>(
+      `SELECT e.error, e.fix, e.created_at, ${rankExpr("errors")} AS rank
+       FROM errors e ${join}
+       WHERE ${where}
+       ORDER BY rank ${b === "sqlite" ? "ASC" : "DESC"}
+       LIMIT 5`, allParams
+    );
     for (const r of rows) {
       if (!r.fix) continue;
       const age = (now - new Date(r.created_at).getTime()) / 86400000;
       const decay = Math.pow(0.97, age);
-      results.push({
-        type: "error/fix",
-        text: `${r.error} → ${r.fix}`,
-        date: r.created_at?.slice(0, 10) || "",
-        score: Math.abs(r.rank) * decay * 0.9,
-      });
+      results.push({ type: "error/fix", text: `${r.error} → ${r.fix}`, date: r.created_at?.slice(0, 10) || "", score: Math.abs(r.rank) * decay * 0.9 });
     }
   } catch {}
 
-  // Search session summaries (context — what did we work on?)
+  // Search LoA entries
   try {
-    const rows = db
-      .prepare(
-        `SELECT l.title, snippet(loa_fts, 1, '', '', '...', 30) as excerpt, l.created_at, rank
-         FROM loa_fts
-         JOIN loa_entries l ON loa_fts.rowid = l.id
-         WHERE loa_fts MATCH ?
-         ORDER BY rank
-         LIMIT 5`
-      )
-      .all(ftsQuery) as any[];
-
+    const { where, join, params } = ftsWhere("loa_entries", "loa_fts");
+    const allParams = [...rankParam("loa_entries"), ...params];
+    const rows = await db.query<any>(
+      `SELECT l.title, l.created_at, ${rankExpr("loa_entries")} AS rank
+       FROM loa_entries l ${join}
+       WHERE ${where}
+       ORDER BY rank ${b === "sqlite" ? "ASC" : "DESC"}
+       LIMIT 5`, allParams
+    );
     for (const r of rows) {
       const age = (now - new Date(r.created_at).getTime()) / 86400000;
       const decay = Math.pow(0.97, age);
-      results.push({
-        type: "past session",
-        text: r.title,
-        date: r.created_at?.slice(0, 10) || "",
-        score: Math.abs(r.rank) * decay * 0.7,
-      });
+      results.push({ type: "past session", text: r.title, date: r.created_at?.slice(0, 10) || "", score: Math.abs(r.rank) * decay * 0.7 });
     }
   } catch {}
 
   // Search learnings
   try {
-    const rows = db
-      .prepare(
-        `SELECT l.problem, l.solution, l.created_at, rank
-         FROM learnings_fts
-         JOIN learnings l ON learnings_fts.rowid = l.id
-         WHERE learnings_fts MATCH ?
-         ORDER BY rank
-         LIMIT 5`
-      )
-      .all(ftsQuery) as any[];
-
+    const { where, join, params } = ftsWhere("learnings", "learnings_fts");
+    const allParams = [...rankParam("learnings"), ...params];
+    const rows = await db.query<any>(
+      `SELECT l.problem, l.solution, l.created_at, ${rankExpr("learnings")} AS rank
+       FROM learnings l ${join}
+       WHERE ${where}
+       ORDER BY rank ${b === "sqlite" ? "ASC" : "DESC"}
+       LIMIT 5`, allParams
+    );
     for (const r of rows) {
       if (!r.solution) continue;
       const age = (now - new Date(r.created_at).getTime()) / 86400000;
       const decay = Math.pow(0.97, age);
-      results.push({
-        type: "learning",
-        text: `${r.problem} → ${r.solution}`,
-        date: r.created_at?.slice(0, 10) || "",
-        score: Math.abs(r.rank) * decay * 0.8,
-      });
+      results.push({ type: "learning", text: `${r.problem} → ${r.solution}`, date: r.created_at?.slice(0, 10) || "", score: Math.abs(r.rank) * decay * 0.8 });
     }
   } catch {}
 
-  db.close();
-
-  // Sort by score descending, apply noise floor, take top N
   results.sort((a, b) => b.score - a.score);
   return results.filter((r) => r.score >= MIN_SCORE).slice(0, MAX_RESULTS);
 }
@@ -348,14 +322,19 @@ async function main() {
   const terms = extractKeyTerms(queryText);
   if (terms.length === 0) return;
 
-  const results = searchMemory(terms);
-  if (results.length === 0) return;
+  const db = await openHookDb();
+  try {
+    const results = await searchMemory(db, terms);
+    if (results.length === 0) return;
 
-  const formatted = formatResults(results);
-  if (!formatted) return;
+    const formatted = formatResults(results);
+    if (!formatted) return;
 
-  // Output as system-reminder for context injection
-  console.log(`<system-reminder>\n${formatted}\n</system-reminder>`);
+    // Output as system-reminder for context injection
+    console.log(`<system-reminder>\n${formatted}\n</system-reminder>`);
+  } finally {
+    await db.close();
+  }
 }
 
 main().catch(() => process.exit(0)); // Fail silently — never block the user

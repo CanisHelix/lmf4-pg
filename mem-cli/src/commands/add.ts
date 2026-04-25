@@ -9,21 +9,14 @@ interface AddBreadcrumbOptions {
   importance?: number;
 }
 
-export function runAddBreadcrumb(content: string, options: AddBreadcrumbOptions): void {
+export async function runAddBreadcrumb(content: string, options: AddBreadcrumbOptions): Promise<void> {
   if (!content || !content.trim()) {
     console.error('Error: Content cannot be empty');
     process.exit(1);
   }
 
   const project = options.project || detectProject();
-
-  const id = addBreadcrumb({
-    content,
-    project,
-    category: options.category,
-    importance: options.importance ?? 5
-  });
-
+  const id = await addBreadcrumb({ content, project, category: options.category, importance: options.importance ?? 5 });
   console.log(`✓ Added breadcrumb #${id}${project ? ` [${project}]` : ''}`);
 }
 
@@ -34,23 +27,17 @@ interface AddDecisionOptions {
   alternatives?: string;
 }
 
-export function runAddDecision(decision: string, options: AddDecisionOptions): void {
+export async function runAddDecision(decision: string, options: AddDecisionOptions): Promise<void> {
   if (!decision || !decision.trim()) {
     console.error('Error: Decision text cannot be empty');
     process.exit(1);
   }
 
   const project = options.project || detectProject();
-
-  const id = addDecision({
-    decision,
-    project,
-    category: options.category,
-    reasoning: options.why,
-    alternatives: options.alternatives,
-    status: 'active'
+  const id = await addDecision({
+    decision, project, category: options.category,
+    reasoning: options.why, alternatives: options.alternatives, status: 'active',
   });
-
   console.log(`✓ Added decision #${id}${project ? ` [${project}]` : ''}`);
 }
 
@@ -61,22 +48,16 @@ interface AddLearningOptions {
   tags?: string;
 }
 
-export function runAddLearning(problem: string, solution: string, options: AddLearningOptions): void {
+export async function runAddLearning(problem: string, solution: string, options: AddLearningOptions): Promise<void> {
   if (!problem || !problem.trim()) {
     console.error('Error: Problem description cannot be empty');
     process.exit(1);
   }
 
   const project = options.project || detectProject();
-
-  const id = addLearning({
-    problem,
-    solution,
-    project,
-    category: options.category,
-    prevention: options.prevention,
-    tags: options.tags
+  const id = await addLearning({
+    problem, solution, project, category: options.category,
+    prevention: options.prevention, tags: options.tags,
   });
-
   console.log(`✓ Added learning #${id}${project ? ` [${project}]` : ''}`);
 }

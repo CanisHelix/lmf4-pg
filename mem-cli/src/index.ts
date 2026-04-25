@@ -3,9 +3,24 @@
 // LMF - Persistent AI Memory System
 // CLI entry point
 
+// Parse --db=sqlite|postgres BEFORE Commander sees the args
+const dbFlagIdx = process.argv.findIndex(a => a.startsWith('--db='));
+if (dbFlagIdx !== -1) {
+  const val = process.argv[dbFlagIdx].split('=')[1].toLowerCase();
+  if (val === 'postgres' || val === 'postgresql') {
+    process.env.LMF_DB_BACKEND = 'postgres';
+  } else if (val === 'sqlite') {
+    process.env.LMF_DB_BACKEND = 'sqlite';
+  } else {
+    console.error(`Unknown --db value: ${val}. Use 'sqlite' or 'postgres'.`);
+    process.exit(1);
+  }
+  process.argv.splice(dbFlagIdx, 1);
+}
+
 import { Command } from 'commander';
 import { VERSION, DISPLAY_NAME } from './version.js';
-import { runInit } from './commands/init.js';
+import { runInit, runMigrate } from './commands/init.js';
 import { runAddBreadcrumb, runAddDecision, runAddLearning } from './commands/add.js';
 import { runSearch } from './commands/search.js';
 import { runRecent } from './commands/recent.js';
@@ -18,7 +33,8 @@ import { runImportLegacy } from './commands/import-legacy.js';
 import { runImportDocs, runDocsList, runDocsSearch, runDocsShow } from './commands/import-docs.js';
 import { runCatchup } from './commands/catchup.js';
 import { runEmbedBackfill, runSemanticSearch, runEmbedStats, runHybridSearch } from './commands/embed.js';
-import { closeDb } from './db/connection.js';
+import { runMigrateToPg } from './commands/migrate-to-pg.js';
+import { closeDb } from './db/index.js';
 
 const program = new Command();
 
@@ -31,16 +47,32 @@ program
 // mem init
 program
   .command('init')
-  .description('Initialize the memory database')
-  .action(() => {
-    runInit();
-    closeDb();
+  .description('Initialize the memory database (safe to re-run)')
+  .action(async () => {
+    await runInit();
+    await closeDb();
   });
 
-// mem add breadcrumb
-const addCmd = program
-  .command('add')
-  .description('Add a memory record');
+// mem migrate
+program
+  .command('migrate')
+  .description('Apply pending schema migrations to an existing database')
+  .action(async () => {
+    await runMigrate();
+    await closeDb();
+  });
+
+// mem migrate-to-pg
+program
+  .command('migrate-to-pg')
+  .description('Copy existing SQLite data into PostgreSQL (use LMF_DATABASE_URL or --db=postgres)')
+  .option('-y, --yes', 'Perform migration (default: dry-run preview)')
+  .action(async (options) => {
+    await runMigrateToPg({ yes: options.yes });
+  });
+
+// mem add
+const addCmd = program.command('add').description('Add a memory record');
 
 addCmd
   .command('breadcrumb <content>')
@@ -48,13 +80,9 @@ addCmd
   .option('-p, --project <name>', 'Project name')
   .option('-c, --category <cat>', 'Category (context, note, todo, reference)')
   .option('-i, --importance <n>', 'Importance 1-10', '5')
-  .action((content, options) => {
-    runAddBreadcrumb(content, {
-      project: options.project,
-      category: options.category,
-      importance: parseInt(options.importance, 10)
-    });
-    closeDb();
+  .action(async (content, options) => {
+    await runAddBreadcrumb(content, { project: options.project, category: options.category, importance: parseInt(options.importance, 10) });
+    await closeDb();
   });
 
 addCmd
@@ -64,14 +92,9 @@ addCmd
   .option('-c, --category <cat>', 'Category (architecture, tooling, process)')
   .option('-w, --why <reasoning>', 'Why this decision was made')
   .option('-a, --alternatives <alt>', 'Alternatives considered')
-  .action((decision, options) => {
-    runAddDecision(decision, {
-      project: options.project,
-      category: options.category,
-      why: options.why,
-      alternatives: options.alternatives
-    });
-    closeDb();
+  .action(async (decision, options) => {
+    await runAddDecision(decision, { project: options.project, category: options.category, why: options.why, alternatives: options.alternatives });
+    await closeDb();
   });
 
 addCmd
@@ -81,14 +104,9 @@ addCmd
   .option('-c, --category <cat>', 'Category (error, pattern, optimization)')
   .option('--prevention <text>', 'How to prevent in future')
   .option('-t, --tags <tags>', 'Comma-separated tags')
-  .action((problem, solution, options) => {
-    runAddLearning(problem, solution, {
-      project: options.project,
-      category: options.category,
-      prevention: options.prevention,
-      tags: options.tags
-    });
-    closeDb();
+  .action(async (problem, solution, options) => {
+    await runAddLearning(problem, solution, { project: options.project, category: options.category, prevention: options.prevention, tags: options.tags });
+    await closeDb();
   });
 
 // mem search
@@ -98,13 +116,9 @@ program
   .option('-p, --project <name>', 'Filter by project')
   .option('-t, --table <table>', 'Search specific table (messages, decisions, learnings, breadcrumbs)')
   .option('-l, --limit <n>', 'Max results', '20')
-  .action((query, options) => {
-    runSearch(query, {
-      project: options.project,
-      table: options.table,
-      limit: parseInt(options.limit, 10)
-    });
-    closeDb();
+  .action(async (query, options) => {
+    await runSearch(query, { project: options.project, table: options.table, limit: parseInt(options.limit, 10) });
+    await closeDb();
   });
 
 // mem recent
@@ -113,30 +127,27 @@ program
   .description('Show recent records (messages, decisions, learnings, breadcrumbs, all)')
   .option('-p, --project <name>', 'Filter by project')
   .option('-l, --limit <n>', 'Max results', '10')
-  .action((table, options) => {
-    runRecent(table, {
-      project: options.project,
-      limit: parseInt(options.limit, 10)
-    });
-    closeDb();
+  .action(async (table, options) => {
+    await runRecent(table, { project: options.project, limit: parseInt(options.limit, 10) });
+    await closeDb();
   });
 
 // mem show
 program
   .command('show <table> <id>')
   .description('Show full details of a record')
-  .action((table, id) => {
-    runShow(table, parseInt(id, 10));
-    closeDb();
+  .action(async (table, id) => {
+    await runShow(table, parseInt(id, 10));
+    await closeDb();
   });
 
 // mem stats
 program
   .command('stats')
   .description('Show database statistics')
-  .action(() => {
-    runStats();
-    closeDb();
+  .action(async () => {
+    await runStats();
+    await closeDb();
   });
 
 // mem import
@@ -146,19 +157,13 @@ program
   .option('--dry-run', 'Preview what would be imported without making changes')
   .option('-v, --verbose', 'Show detailed progress')
   .option('-y, --yes', 'Confirm import (required to actually import)')
-  .action((options) => {
-    runImport({
-      dryRun: options.dryRun,
-      verbose: options.verbose,
-      yes: options.yes
-    });
-    closeDb();
+  .action(async (options) => {
+    await runImport({ dryRun: options.dryRun, verbose: options.verbose, yes: options.yes });
+    await closeDb();
   });
 
-// mem loa - Library of Alexandria
-const loaCmd = program
-  .command('loa')
-  .description('Library of Alexandria - curated knowledge capture');
+// mem loa
+const loaCmd = program.command('loa').description('Library of Alexandria - curated knowledge capture');
 
 loaCmd
   .command('write <title>')
@@ -172,37 +177,37 @@ loaCmd
       project: options.project,
       continues: options.continues ? parseInt(options.continues, 10) : undefined,
       tags: options.tags,
-      limit: options.limit ? parseInt(options.limit, 10) : undefined
+      limit: options.limit ? parseInt(options.limit, 10) : undefined,
     });
-    closeDb();
+    await closeDb();
   });
 
 loaCmd
   .command('show <id>')
   .description('Show full LoA entry with its extract')
-  .action((id) => {
-    runLoaShow(parseInt(id, 10));
-    closeDb();
+  .action(async (id) => {
+    await runLoaShow(parseInt(id, 10));
+    await closeDb();
   });
 
 loaCmd
   .command('quote <id>')
   .description('Show the raw source messages for an LoA entry')
-  .action((id) => {
-    runLoaQuote(parseInt(id, 10));
-    closeDb();
+  .action(async (id) => {
+    await runLoaQuote(parseInt(id, 10));
+    await closeDb();
   });
 
 loaCmd
   .command('list')
   .description('List recent LoA entries')
   .option('-l, --limit <n>', 'Max entries', '10')
-  .action((options) => {
-    runLoaList(parseInt(options.limit, 10));
-    closeDb();
+  .action(async (options) => {
+    await runLoaList(parseInt(options.limit, 10));
+    await closeDb();
   });
 
-// mem import-legacy - Import DISTILLED.md extracts
+// mem import-legacy
 program
   .command('import-legacy')
   .description('Import legacy DISTILLED.md extracts as LoA entries')
@@ -210,27 +215,22 @@ program
   .option('-v, --verbose', 'Show detailed progress')
   .option('-y, --yes', 'Confirm import')
   .option('-s, --source <source>', 'Source: distilled, hot_recall, or all', 'all')
-  .action((options) => {
-    runImportLegacy({
-      dryRun: options.dryRun,
-      verbose: options.verbose,
-      yes: options.yes,
-      source: options.source
-    });
-    closeDb();
+  .action(async (options) => {
+    await runImportLegacy({ dryRun: options.dryRun, verbose: options.verbose, yes: options.yes, source: options.source });
+    await closeDb();
   });
 
-// mem catchup - Batch extraction of unprocessed sessions (wired to systemd timer)
+// mem catchup
 program
   .command('catchup')
   .description('Extract any unprocessed session transcripts (idempotent; safe to run often)')
   .option('-f, --force', 'Re-extract all sessions, even already-extracted ones')
   .action(async (options) => {
     await runCatchup({ force: !!options.force });
-    closeDb();
+    await closeDb();
   });
 
-// mem dump - Flush current session + capture LoA
+// mem dump
 program
   .command('dump <title>')
   .description('Flush current session to DB and capture LoA entry')
@@ -245,15 +245,13 @@ program
       continues: options.continues ? parseInt(options.continues, 10) : undefined,
       tags: options.tags,
       limit: options.limit ? parseInt(options.limit, 10) : undefined,
-      skipFabric: options.skipFabric
+      skipFabric: options.skipFabric,
     });
-    closeDb();
+    await closeDb();
   });
 
-// mem docs - Standalone document management
-const docsCmd = program
-  .command('docs')
-  .description('Standalone documents - diary, reference, wisdom files');
+// mem docs
+const docsCmd = program.command('docs').description('Standalone documents - diary, reference, wisdom files');
 
 docsCmd
   .command('import')
@@ -261,44 +259,26 @@ docsCmd
   .option('--dry-run', 'Preview what would be imported')
   .option('-v, --verbose', 'Show detailed progress')
   .option('-y, --yes', 'Confirm import')
-  .action((options) => {
-    runImportDocs({
-      dryRun: options.dryRun,
-      verbose: options.verbose,
-      yes: options.yes
-    });
-    closeDb();
+  .action(async (options) => {
+    await runImportDocs({ dryRun: options.dryRun, verbose: options.verbose, yes: options.yes });
+    await closeDb();
   });
 
-docsCmd
-  .command('list')
-  .description('List imported documents')
-  .action(() => {
-    runDocsList();
-    closeDb();
-  });
+docsCmd.command('list').description('List imported documents').action(async () => { await runDocsList(); await closeDb(); });
 
 docsCmd
   .command('search <query>')
   .description('Search documents')
   .option('-l, --limit <n>', 'Max results', '10')
-  .action((query, options) => {
-    runDocsSearch(query, parseInt(options.limit, 10));
-    closeDb();
+  .action(async (query, options) => {
+    await runDocsSearch(query, parseInt(options.limit, 10));
+    await closeDb();
   });
 
-docsCmd
-  .command('show <id>')
-  .description('Show a document')
-  .action((id) => {
-    runDocsShow(parseInt(id, 10));
-    closeDb();
-  });
+docsCmd.command('show <id>').description('Show a document').action(async (id) => { await runDocsShow(parseInt(id, 10)); await closeDb(); });
 
-// mem embed - Vector embeddings for semantic search
-const embedCmd = program
-  .command('embed')
-  .description('Vector embeddings for semantic search');
+// mem embed
+const embedCmd = program.command('embed').description('Vector embeddings for semantic search');
 
 embedCmd
   .command('backfill')
@@ -307,83 +287,55 @@ embedCmd
   .option('-l, --limit <n>', 'Max records to embed', '100')
   .option('-f, --force', 'Re-embed even if already embedded')
   .action(async (options) => {
-    await runEmbedBackfill({
-      table: options.table as 'loa' | 'decisions' | 'messages',
-      limit: parseInt(options.limit, 10),
-      force: options.force
-    });
-    closeDb();
+    await runEmbedBackfill({ table: options.table as 'loa' | 'decisions' | 'messages', limit: parseInt(options.limit, 10), force: options.force });
+    await closeDb();
   });
 
-embedCmd
-  .command('stats')
-  .description('Show embedding statistics')
-  .action(() => {
-    runEmbedStats();
-    closeDb();
-  });
+embedCmd.command('stats').description('Show embedding statistics').action(async () => { await runEmbedStats(); await closeDb(); });
 
-// mem semantic <query> - Semantic search
+// mem semantic
 program
   .command('semantic <query>')
   .description('Semantic search using vector embeddings')
   .option('-t, --table <table>', 'Search specific table (loa_entries, decisions, messages)')
   .option('-l, --limit <n>', 'Max results', '10')
   .action(async (query, options) => {
-    await runSemanticSearch(query, {
-      table: options.table,
-      limit: parseInt(options.limit, 10)
-    });
-    closeDb();
+    await runSemanticSearch(query, { table: options.table, limit: parseInt(options.limit, 10) });
+    await closeDb();
   });
 
-// mem hybrid <query> - Hybrid search (FTS5 + semantic with RRF fusion)
+// mem hybrid
 program
   .command('hybrid <query>')
-  .description('Hybrid search combining keywords (FTS5) + semantics (embeddings) with RRF fusion')
+  .description('Hybrid search combining keywords (FTS) + semantics (embeddings) with RRF fusion')
   .option('-t, --table <table>', 'Search specific table (loa_entries, decisions, messages)')
   .option('-l, --limit <n>', 'Max results', '10')
   .action(async (query, options) => {
-    await runHybridSearch(query, {
-      table: options.table,
-      limit: parseInt(options.limit, 10)
-    });
-    closeDb();
+    await runHybridSearch(query, { table: options.table, limit: parseInt(options.limit, 10) });
+    await closeDb();
   });
 
-// Default command: mem <query> → hybrid search (Phase 3: best of both worlds)
+// Default: mem <query> → hybrid search
 program
   .arguments('[query]')
   .option('-p, --project <name>', 'Filter by project')
   .option('-t, --table <table>', 'Search specific table')
   .option('-l, --limit <n>', 'Max results', '10')
-  .option('-k, --keyword', 'Use keyword search only (FTS5)')
+  .option('-k, --keyword', 'Use keyword search only (FTS)')
   .option('-v, --vector', 'Use vector search only (semantic)')
   .action(async (query, options) => {
-    if (query && !['init', 'add', 'search', 'recent', 'show', 'stats', 'import', 'loa', 'docs', 'dump', 'embed', 'semantic', 'hybrid', 'catchup', 'import-legacy'].includes(query)) {
+    const knownCommands = ['init', 'migrate', 'migrate-to-pg', 'add', 'search', 'recent', 'show',
+      'stats', 'import', 'loa', 'docs', 'dump', 'embed', 'semantic', 'hybrid', 'catchup', 'import-legacy'];
+    if (query && !knownCommands.includes(query)) {
       if (options.keyword) {
-        // FTS5 only
-        runSearch(query, {
-          project: options.project,
-          table: options.table,
-          limit: parseInt(options.limit, 10)
-        });
+        await runSearch(query, { project: options.project, table: options.table, limit: parseInt(options.limit, 10) });
       } else if (options.vector) {
-        // Semantic only
-        await runSemanticSearch(query, {
-          table: options.table,
-          limit: parseInt(options.limit, 10)
-        });
+        await runSemanticSearch(query, { table: options.table, limit: parseInt(options.limit, 10) });
       } else {
-        // Default: hybrid (best results)
-        await runHybridSearch(query, {
-          table: options.table,
-          limit: parseInt(options.limit, 10)
-        });
+        await runHybridSearch(query, { table: options.table, limit: parseInt(options.limit, 10) });
       }
-      closeDb();
+      await closeDb();
     }
   });
 
-// Parse and run
 program.parse();

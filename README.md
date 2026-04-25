@@ -691,9 +691,12 @@ mkdir -p ~/.claude/tools
 cp $LMF4_DIR/hooks/* ~/.claude/hooks/
 chmod +x ~/.claude/hooks/*.ts ~/.claude/hooks/*.sh
 cp $LMF4_DIR/tools/Inference.ts ~/.claude/tools/
+
+# Install hook dependencies (postgres.js for dual-backend support)
+cd ~/.claude/hooks && bun install && cd -
 ```
 
-**Verify:** `ls ~/.claude/hooks/ | wc -l` shows 6+ files.
+**Verify:** `ls ~/.claude/hooks/ | wc -l` shows 7+ files.
 
 ## Step 4: Install MCP memory server
 

@@ -2,7 +2,7 @@
 /**
  * mem-mcp-server.ts — MCP server for PAI memory search
  *
- * Exposes memory.db (SQLite + FTS5) as MCP tools so Claude can search
+ * Exposes the LMF memory database as MCP tools so Claude can search
  * past sessions, decisions, errors, and learnings without shelling out.
  *
  * Tools:
@@ -12,10 +12,8 @@
  * Runs as stdio MCP server, wired in settings.json mcpServers.
  */
 
-import { Database } from "bun:sqlite";
 import { join } from "path";
-
-const DB_PATH = join(process.env.HOME!, ".claude", "memory.db");
+import { openHookDb, type HookDb } from "../hooks/hook-db.js";
 
 // ─── MCP Protocol Types ───────────────────────────────────────────
 
@@ -35,107 +33,90 @@ interface JsonRpcResponse {
 
 // ─── Database Queries ─────────────────────────────────────────────
 
-function getDb(): Database {
-  return new Database(DB_PATH, { readonly: true });
-}
-
-function searchMemory(query: string, limit: number = 15): any[] {
-  const db = getDb();
+async function searchMemory(db: HookDb, query: string, limit: number = 15): Promise<any[]> {
+  const b = db.backend;
   const results: any[] = [];
 
-  // Search LoA entries (session extractions)
+  const ftsWhere = (table: string, ftsTable: string) => b === "sqlite"
+    ? { where: `${ftsTable} MATCH ?`, join: `JOIN ${ftsTable} ON ${ftsTable}.rowid = ${table}.id`, params: [query] as unknown[] }
+    : { where: `${table}.fts @@ plainto_tsquery('english', ?)`, join: "", params: [query] as unknown[] };
+
+  const rankExpr = (table: string) => b === "sqlite"
+    ? `rank`
+    : `ts_rank(${table}.fts, plainto_tsquery('english', ?))`;
+  const rankParam = (): unknown[] => b === "sqlite" ? [] : [query];
+
+  // LoA entries (session extractions)
   try {
-    const loa = db
-      .prepare(
-        `SELECT l.created_at, l.project, l.title, snippet(loa_fts, 1, '>>>', '<<<', '...', 40) as excerpt
-         FROM loa_fts JOIN loa_entries l ON loa_fts.rowid = l.id
-         WHERE loa_fts MATCH ?
-         ORDER BY rank LIMIT ?`
-      )
-      .all(query, limit);
-    for (const r of loa as any[]) {
-      results.push({ type: "session", date: r.created_at, project: r.project, title: r.title, excerpt: r.excerpt });
-    }
+    const { where, join, params } = ftsWhere("loa_entries", "loa_fts");
+    const rows = await db.query<any>(
+      `SELECT l.created_at, l.project, l.title, ${rankExpr("loa_entries")} AS rank
+       FROM loa_entries l ${join}
+       WHERE ${where}
+       ORDER BY rank ${b === "sqlite" ? "ASC" : "DESC"}
+       LIMIT ?`, [...rankParam(), ...params, limit]
+    );
+    for (const r of rows) results.push({ type: "session", date: r.created_at, project: r.project, title: r.title, excerpt: "" });
   } catch {}
 
-  // Search decisions
+  // Decisions
   try {
-    const decisions = db
-      .prepare(
-        `SELECT d.created_at, d.project, d.decision, d.reasoning
-         FROM decisions_fts JOIN decisions d ON decisions_fts.rowid = d.id
-         WHERE decisions_fts MATCH ?
-         ORDER BY rank LIMIT ?`
-      )
-      .all(query, Math.min(limit, 10));
-    for (const r of decisions as any[]) {
-      results.push({ type: "decision", date: r.created_at, project: r.project, decision: r.decision, reasoning: r.reasoning });
-    }
+    const { where, join, params } = ftsWhere("decisions", "decisions_fts");
+    const rows = await db.query<any>(
+      `SELECT d.created_at, d.project, d.decision, d.reasoning, ${rankExpr("decisions")} AS rank
+       FROM decisions d ${join}
+       WHERE ${where}
+       ORDER BY rank ${b === "sqlite" ? "ASC" : "DESC"}
+       LIMIT ?`, [...rankParam(), ...params, Math.min(limit, 10)]
+    );
+    for (const r of rows) results.push({ type: "decision", date: r.created_at, project: r.project, decision: r.decision, reasoning: r.reasoning });
   } catch {}
 
-  // Search errors
+  // Errors
   try {
-    const errors = db
-      .prepare(
-        `SELECT e.created_at, e.error, e.fix, e.frequency
-         FROM errors_fts JOIN errors e ON errors_fts.rowid = e.id
-         WHERE errors_fts MATCH ?
-         ORDER BY rank LIMIT ?`
-      )
-      .all(query, Math.min(limit, 10));
-    for (const r of errors as any[]) {
-      results.push({ type: "error", date: r.created_at, error: r.error, fix: r.fix, frequency: r.frequency });
-    }
+    const { where, join, params } = ftsWhere("errors", "errors_fts");
+    const rows = await db.query<any>(
+      `SELECT e.created_at, e.error, e.fix, e.frequency, ${rankExpr("errors")} AS rank
+       FROM errors e ${join}
+       WHERE ${where}
+       ORDER BY rank ${b === "sqlite" ? "ASC" : "DESC"}
+       LIMIT ?`, [...rankParam(), ...params, Math.min(limit, 10)]
+    );
+    for (const r of rows) results.push({ type: "error", date: r.created_at, error: r.error, fix: r.fix, frequency: r.frequency });
   } catch {}
 
-  // Search learnings
+  // Learnings
   try {
-    const learnings = db
-      .prepare(
-        `SELECT l.created_at, l.project, l.problem, l.solution
-         FROM learnings_fts JOIN learnings l ON learnings_fts.rowid = l.id
-         WHERE learnings_fts MATCH ?
-         ORDER BY rank LIMIT ?`
-      )
-      .all(query, Math.min(limit, 10));
-    for (const r of learnings as any[]) {
-      results.push({ type: "learning", date: r.created_at, project: r.project, problem: r.problem, solution: r.solution });
-    }
+    const { where, join, params } = ftsWhere("learnings", "learnings_fts");
+    const rows = await db.query<any>(
+      `SELECT l.created_at, l.project, l.problem, l.solution, ${rankExpr("learnings")} AS rank
+       FROM learnings l ${join}
+       WHERE ${where}
+       ORDER BY rank ${b === "sqlite" ? "ASC" : "DESC"}
+       LIMIT ?`, [...rankParam(), ...params, Math.min(limit, 10)]
+    );
+    for (const r of rows) results.push({ type: "learning", date: r.created_at, project: r.project, problem: r.problem, solution: r.solution });
   } catch {}
 
-  db.close();
   return results;
 }
 
-function recallRecent(count: number = 5, project?: string): any[] {
-  const db = getDb();
-  let query = `SELECT created_at, project, title, fabric_extract FROM loa_entries`;
-  const params: any[] = [];
-
-  if (project) {
-    query += ` WHERE project = ?`;
-    params.push(project);
-  }
-
-  query += ` ORDER BY rowid DESC LIMIT ?`;
-  params.push(count);
-
-  const results = db.prepare(query).all(...params) as any[];
-  db.close();
-  return results;
+async function recallRecent(db: HookDb, count: number = 5, project?: string): Promise<any[]> {
+  const sql = project
+    ? `SELECT created_at, project, title, fabric_extract FROM loa_entries WHERE project = ? ORDER BY id DESC LIMIT ?`
+    : `SELECT created_at, project, title, fabric_extract FROM loa_entries ORDER BY id DESC LIMIT ?`;
+  return db.query<any>(sql, project ? [project, count] : [count]);
 }
 
-function getStats(): any {
-  const db = getDb();
-  const stats = {
-    sessions: (db.prepare("SELECT COUNT(*) as c FROM loa_entries").get() as any).c,
-    decisions: (db.prepare("SELECT COUNT(*) as c FROM decisions").get() as any).c,
-    errors: (db.prepare("SELECT COUNT(*) as c FROM errors").get() as any).c,
-    learnings: (db.prepare("SELECT COUNT(*) as c FROM learnings").get() as any).c,
-    date_range: db.prepare("SELECT MIN(created_at) as earliest, MAX(created_at) as latest FROM loa_entries").get(),
-  };
-  db.close();
-  return stats;
+async function getStats(db: HookDb): Promise<any> {
+  const count = async (t: string) => ((await db.queryOne<{ c: number }>(`SELECT COUNT(*) as c FROM ${t}`))?.c ?? 0);
+  const [sessions, decisions, errors, learnings] = await Promise.all([
+    count("loa_entries"), count("decisions"), count("errors"), count("learnings"),
+  ]);
+  const dateRange = await db.queryOne<{ earliest: string; latest: string }>(
+    `SELECT MIN(created_at) as earliest, MAX(created_at) as latest FROM loa_entries`
+  );
+  return { sessions, decisions, errors, learnings, date_range: dateRange };
 }
 
 // ─── MCP Protocol Handler ─────────────────────────────────────────
@@ -144,11 +125,11 @@ const TOOLS = [
   {
     name: "memory_search",
     description:
-      "Search your persistent memory across all sessions, decisions, errors, and learnings. Uses full-text search (FTS5) over your extracted session transcripts. Use this to find past context, decisions, error fixes, or any topic discussed in previous conversations.",
+      "Search your persistent memory across all sessions, decisions, errors, and learnings. Uses full-text search over your extracted session transcripts. Use this to find past context, decisions, error fixes, or any topic discussed in previous conversations.",
     inputSchema: {
       type: "object" as const,
       properties: {
-        query: { type: "string" as const, description: "Search query (supports FTS5 syntax: AND, OR, NOT, phrases in quotes)" },
+        query: { type: "string" as const, description: "Search query" },
         limit: { type: "number" as const, description: "Max results (default 15)", default: 15 },
       },
       required: ["query"],
@@ -168,7 +149,7 @@ const TOOLS = [
   },
 ];
 
-function handleRequest(req: JsonRpcRequest): JsonRpcResponse {
+async function handleRequest(db: HookDb, req: JsonRpcRequest): Promise<JsonRpcResponse | null> {
   switch (req.method) {
     case "initialize":
       return {
@@ -182,8 +163,7 @@ function handleRequest(req: JsonRpcRequest): JsonRpcResponse {
       };
 
     case "notifications/initialized":
-      // No response needed for notifications
-      return null as any;
+      return null;
 
     case "tools/list":
       return { jsonrpc: "2.0", id: req.id ?? null, result: { tools: TOOLS } };
@@ -193,97 +173,70 @@ function handleRequest(req: JsonRpcRequest): JsonRpcResponse {
       const args = req.params?.arguments || {};
 
       if (toolName === "memory_search") {
-        const results = searchMemory(args.query, args.limit || 15);
-        const stats = getStats();
-        const text =
-          results.length === 0
-            ? `No results for "${args.query}" (searched ${stats.sessions} sessions, ${stats.decisions} decisions, ${stats.errors} errors)`
-            : results
-                .map((r) => {
-                  if (r.type === "session") return `[SESSION ${r.date}] ${r.project}: ${r.title}\n  ${r.excerpt}`;
-                  if (r.type === "decision") return `[DECISION ${r.date}] ${r.project}: ${r.decision} — ${r.reasoning || ""}`;
-                  if (r.type === "error") return `[ERROR ×${r.frequency}] ${r.error}: ${r.fix}`;
-                  if (r.type === "learning") return `[LEARNING ${r.date}] ${r.project}: ${r.problem} → ${r.solution}`;
-                  return JSON.stringify(r);
-                })
-                .join("\n\n");
+        const results = await searchMemory(db, args.query, args.limit || 15);
+        const stats = await getStats(db);
+        const text = results.length === 0
+          ? `No results for "${args.query}" (searched ${stats.sessions} sessions, ${stats.decisions} decisions, ${stats.errors} errors)`
+          : results.map((r) => {
+              if (r.type === "session") return `[SESSION ${r.date}] ${r.project}: ${r.title}`;
+              if (r.type === "decision") return `[DECISION ${r.date}] ${r.project}: ${r.decision} — ${r.reasoning || ""}`;
+              if (r.type === "error") return `[ERROR ×${r.frequency}] ${r.error}: ${r.fix}`;
+              if (r.type === "learning") return `[LEARNING ${r.date}] ${r.project}: ${r.problem} → ${r.solution}`;
+              return JSON.stringify(r);
+            }).join("\n\n");
 
-        return {
-          jsonrpc: "2.0",
-          id: req.id ?? null,
-          result: { content: [{ type: "text", text }] },
-        };
+        return { jsonrpc: "2.0", id: req.id ?? null, result: { content: [{ type: "text", text }] } };
       }
 
       if (toolName === "memory_recall") {
-        const results = recallRecent(args.count || 5, args.project);
-        const text =
-          results.length === 0
-            ? "No recent sessions found."
-            : results
-                .map((r) => `## ${r.created_at} | ${r.project}\n${r.title}\n\n${r.fabric_extract?.slice(0, 500) || ""}`)
-                .join("\n\n---\n\n");
+        const results = await recallRecent(db, args.count || 5, args.project);
+        const text = results.length === 0
+          ? "No recent sessions found."
+          : results.map((r: any) => `## ${r.created_at} | ${r.project}\n${r.title}\n\n${r.fabric_extract?.slice(0, 500) || ""}`).join("\n\n---\n\n");
 
-        return {
-          jsonrpc: "2.0",
-          id: req.id ?? null,
-          result: { content: [{ type: "text", text }] },
-        };
+        return { jsonrpc: "2.0", id: req.id ?? null, result: { content: [{ type: "text", text }] } };
       }
 
-      return {
-        jsonrpc: "2.0",
-        id: req.id ?? null,
-        error: { code: -32601, message: `Unknown tool: ${toolName}` },
-      };
+      return { jsonrpc: "2.0", id: req.id ?? null, error: { code: -32601, message: `Unknown tool: ${toolName}` } };
     }
 
     default:
-      return {
-        jsonrpc: "2.0",
-        id: req.id ?? null,
-        error: { code: -32601, message: `Unknown method: ${req.method}` },
-      };
+      return { jsonrpc: "2.0", id: req.id ?? null, error: { code: -32601, message: `Unknown method: ${req.method}` } };
   }
 }
 
 // ─── Stdio Transport ──────────────────────────────────────────────
 
 async function main() {
+  const db = await openHookDb();
   const decoder = new TextDecoder();
   let buffer = "";
 
   const reader = Bun.stdin.stream().getReader();
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
 
-    buffer += decoder.decode(value, { stream: true });
+      buffer += decoder.decode(value, { stream: true });
 
-    // Process complete lines (JSON-RPC messages are newline-delimited)
-    let newlineIdx;
-    while ((newlineIdx = buffer.indexOf("\n")) !== -1) {
-      const line = buffer.slice(0, newlineIdx).trim();
-      buffer = buffer.slice(newlineIdx + 1);
-
-      if (!line) continue;
-
-      try {
-        const req: JsonRpcRequest = JSON.parse(line);
-        const res = handleRequest(req);
-        if (res) {
-          process.stdout.write(JSON.stringify(res) + "\n");
+      let newlineIdx;
+      while ((newlineIdx = buffer.indexOf("\n")) !== -1) {
+        const line = buffer.slice(0, newlineIdx).trim();
+        buffer = buffer.slice(newlineIdx + 1);
+        if (!line) continue;
+        try {
+          const req: JsonRpcRequest = JSON.parse(line);
+          const res = await handleRequest(db, req);
+          if (res) process.stdout.write(JSON.stringify(res) + "\n");
+        } catch (e: any) {
+          process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32700, message: `Parse error: ${e.message}` } }) + "\n");
         }
-      } catch (e: any) {
-        const errorRes: JsonRpcResponse = {
-          jsonrpc: "2.0",
-          id: null,
-          error: { code: -32700, message: `Parse error: ${e.message}` },
-        };
-        process.stdout.write(JSON.stringify(errorRes) + "\n");
       }
     }
+  } finally {
+    await db.close();
   }
 }
 

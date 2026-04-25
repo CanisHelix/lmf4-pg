@@ -167,7 +167,7 @@ fi
 #######################################################################
 log "Installing memory hooks..."
 HOOKS_INSTALLED=0
-for hook in SessionExtract.hook.ts AssociativeRecall.hook.ts PreCompact.hook.sh PostCompact.hook.ts StopFailure.hook.ts; do
+for hook in SessionExtract.hook.ts AssociativeRecall.hook.ts PreCompact.hook.sh PostCompact.hook.ts StopFailure.hook.ts hook-db.ts; do
     src="$SCRIPT_DIR/hooks/$hook"
     dst="$HOOKS_DIR/$hook"
     if [ -f "$src" ]; then
@@ -182,7 +182,14 @@ for hook in SessionExtract.hook.ts AssociativeRecall.hook.ts PreCompact.hook.sh 
         err "Missing: hooks/$hook"
     fi
 done
-ok "Hooks ($HOOKS_INSTALLED new/updated, 6 total)"
+
+# Install postgres dependency for hook-db.ts
+if [ -f "$SCRIPT_DIR/hooks/package.json" ]; then
+    cp "$SCRIPT_DIR/hooks/package.json" "$HOOKS_DIR/package.json"
+    (cd "$HOOKS_DIR" && bun install --silent 2>/dev/null || true)
+fi
+
+ok "Hooks ($HOOKS_INSTALLED new/updated, 7 total)"
 
 #######################################################################
 # 4. Install MCP server

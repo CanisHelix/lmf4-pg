@@ -3,7 +3,6 @@
 import { readdirSync, readFileSync, existsSync } from 'fs';
 import { join, basename, dirname } from 'path';
 import { homedir } from 'os';
-import { getDb } from '../db/connection.js';
 import { createSession, sessionExists, addMessagesBatch } from './memory.js';
 import { extractProjectFromPath } from './project.js';
 import type { ClaudeSessionLine, Message } from '../types/index.js';
@@ -131,7 +130,7 @@ function parseSessionFile(filePath: string): { sessionId: string; project: strin
 /**
  * Import all sessions from Claude Code projects directory
  */
-export function importAllSessions(options?: { dryRun?: boolean; verbose?: boolean }): ImportResult {
+export async function importAllSessions(options?: { dryRun?: boolean; verbose?: boolean }): Promise<ImportResult> {
   const result: ImportResult = {
     sessionsImported: 0,
     sessionsSkipped: 0,
@@ -154,8 +153,7 @@ export function importAllSessions(options?: { dryRun?: boolean; verbose?: boolea
         continue;
       }
 
-      // Check if session already exists
-      if (sessionExists(parsed.sessionId)) {
+      if (await sessionExists(parsed.sessionId)) {
         if (options?.verbose) {
           console.log(`Skipping existing session: ${parsed.sessionId}`);
         }
@@ -170,13 +168,11 @@ export function importAllSessions(options?: { dryRun?: boolean; verbose?: boolea
         continue;
       }
 
-      // Get timestamps from messages
       const timestamps = parsed.messages.map(m => m.timestamp).sort();
       const startedAt = timestamps[0];
       const endedAt = timestamps[timestamps.length - 1];
 
-      // Create session
-      createSession({
+      await createSession({
         session_id: parsed.sessionId,
         started_at: startedAt,
         ended_at: endedAt,
@@ -184,8 +180,7 @@ export function importAllSessions(options?: { dryRun?: boolean; verbose?: boolea
         summary: `Imported from ${basename(file)}`
       });
 
-      // Insert messages in batch
-      const count = addMessagesBatch(parsed.messages);
+      const count = await addMessagesBatch(parsed.messages);
 
       result.sessionsImported++;
       result.messagesImported += count;
@@ -205,7 +200,7 @@ export function importAllSessions(options?: { dryRun?: boolean; verbose?: boolea
 /**
  * Get import preview without making changes
  */
-export function previewImport(): { total: number; existing: number; new: number; files: string[] } {
+export async function previewImport(): Promise<{ total: number; existing: number; new: number; files: string[] }> {
   const files = findSessionFiles();
   let existing = 0;
   let newSessions = 0;
@@ -214,7 +209,7 @@ export function previewImport(): { total: number; existing: number; new: number;
     const parsed = parseSessionFile(file);
     if (!parsed) continue;
 
-    if (sessionExists(parsed.sessionId)) {
+    if (await sessionExists(parsed.sessionId)) {
       existing++;
     } else {
       newSessions++;

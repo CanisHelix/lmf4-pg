@@ -8,11 +8,11 @@ interface SearchOptions {
   limit?: number;
 }
 
-export function runSearch(query: string, options: SearchOptions): void {
-  const results = search(query, {
+export async function runSearch(query: string, options: SearchOptions): Promise<void> {
+  const results = await search(query, {
     project: options.project,
     table: options.table,
-    limit: options.limit || 20
+    limit: options.limit || 20,
   });
 
   if (results.length === 0) {
@@ -26,10 +26,8 @@ export function runSearch(query: string, options: SearchOptions): void {
     const preview = result.content.length > 100
       ? result.content.slice(0, 100) + '...'
       : result.content;
-
     const projectTag = result.project ? ` [${result.project}]` : '';
     const date = result.created_at.split('T')[0];
-
     console.log(`[${result.table}#${result.id}]${projectTag} ${date}`);
     console.log(`  ${preview.replace(/\n/g, ' ')}`);
     console.log('');

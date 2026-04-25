@@ -34,6 +34,7 @@
 import { existsSync, readFileSync, appendFileSync, writeFileSync, readdirSync, statSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { execSync, spawn } from 'child_process';
+import { openHookDb } from './hook-db.js';
 
 const MEMORY_DIR = join(process.env.HOME!, '.claude', 'MEMORY');
 const EXTRACT_LOG = join(MEMORY_DIR, 'EXTRACT_LOG.txt');
@@ -536,10 +537,10 @@ async function extractAndAppend(conversationPath: string, cwd: string): Promise<
     const dirName = cwd.split('/').pop() || 'unknown';
     const sessionId = conversationPath.split('/').pop()?.replace('.jsonl', '') || 'unknown';
 
-    // Write to SQLite database (primary storage)
+    // Write to database (primary storage)
     const summaryMatch = extracted.match(/##\s*ONE\s*SENTENCE\s*SUMMARY\s*\n+(.+)/);
     try {
-      writeToDb(extracted, dirName, timestamp, sessionId, summaryMatch ? summaryMatch[1].trim() : `${dirName} session`);
+      await writeToDb(extracted, dirName, timestamp, sessionId, summaryMatch ? summaryMatch[1].trim() : `${dirName} session`);
     } catch (dbErr: any) {
       console.error(`[SessionExtract] DB write failed: ${dbErr.message}`);
     }
@@ -588,14 +589,10 @@ async function extractAndAppend(conversationPath: string, cwd: string): Promise<
   }
 }
 
-// ─── SQLite DB writes ──────────────────────────────────────────────
-
-const DB_PATH = join(process.env.HOME!, '.claude', 'memory.db');
+// ─── DB writes (backend-agnostic via openHookDb) ───────────────────
 
 // Reject values that are clearly extraction-template leaks — the LLM
 // returned the prompt's placeholder text instead of actual content.
-// These pollute the DB and can never be useful in recall. Returns the
-// original string if clean, or null if it's a placeholder to be rejected.
 // Conservative: only matches bracket-wrapped strings with known template
 // vocabulary. Real bracketed content (e.g. `[42]`, `[error code 137]`) passes.
 function rejectPlaceholder(value: string | null | undefined): string | null {
@@ -610,75 +607,69 @@ function rejectPlaceholder(value: string | null | undefined): string | null {
   return value;
 }
 
-function writeToDb(extracted: string, project: string, date: string, sessionId: string, title: string): void {
-  // Only write if DB exists (mem init has been run)
-  if (!existsSync(DB_PATH)) return;
+async function writeToDb(extracted: string, project: string, date: string, sessionId: string, title: string): Promise<void> {
+  const db = await openHookDb();
 
-  const { Database } = require('bun:sqlite');
-  const db = new Database(DB_PATH);
-  db.run('PRAGMA journal_mode=WAL');
+  try {
+    // 1. Insert LoA entry
+    await db.run(
+      `INSERT INTO loa_entries (created_at, title, fabric_extract, session_id, project) VALUES (?, ?, ?, ?, ?)`,
+      [date, title, extracted, sessionId, project]
+    );
 
-  // 1. Insert LoA entry
-  const loaResult = db.prepare(
-    `INSERT INTO loa_entries (created_at, title, fabric_extract, session_id, project) VALUES (?, ?, ?, ?, ?)`
-  ).run(date, title, extracted, sessionId, project);
+    // 2. Extract and insert decisions
+    const decisionsMatch = extracted.match(/(?:##\s*DECISIONS\s*MADE|DECISIONS:)\s*([\s\S]*?)(?=\n##\s|$)/);
+    if (decisionsMatch) {
+      const lines = decisionsMatch[1].split('\n')
+        .filter((l: string) => l.trim().startsWith('-'))
+        .map((l: string) => l.replace(/^-\s*/, '').replace(/\*\*/g, '').trim())
+        .filter((l: string) => l.length > 5);
 
-  // NOTE: Do NOT insert into loa_fts manually — the trigger handles FTS sync automatically
-
-  // 2. Extract and insert decisions
-  const decisionsMatch = extracted.match(/(?:##\s*DECISIONS\s*MADE|DECISIONS:)\s*([\s\S]*?)(?=\n##\s|$)/);
-  if (decisionsMatch) {
-    const lines = decisionsMatch[1].split('\n')
-      .filter((l: string) => l.trim().startsWith('-'))
-      .map((l: string) => l.replace(/^-\s*/, '').replace(/\*\*/g, '').trim())
-      .filter((l: string) => l.length > 5);
-
-    for (const line of lines) {
-      const parts = line.split(':');
-      const decision = rejectPlaceholder(parts[0].trim());
-      if (!decision) continue; // primary placeholder — no value in storing
-      const reasoning = parts.length > 1 ? rejectPlaceholder(parts.slice(1).join(':').trim()) : null;
-
-      const r = db.prepare(
-        `INSERT INTO decisions (created_at, session_id, project, decision, reasoning) VALUES (?, ?, ?, ?, ?)`
-      ).run(date, sessionId, project, decision, reasoning);
-
-      // NOTE: trigger handles FTS sync automatically
+      for (const line of lines) {
+        const parts = line.split(':');
+        const decision = rejectPlaceholder(parts[0].trim());
+        if (!decision) continue;
+        const reasoning = parts.length > 1 ? rejectPlaceholder(parts.slice(1).join(':').trim()) : null;
+        await db.run(
+          `INSERT INTO decisions (created_at, session_id, project, decision, reasoning) VALUES (?, ?, ?, ?, ?)`,
+          [date, sessionId, project, decision, reasoning]
+        );
+      }
     }
-  }
 
-  // 3. Extract and insert errors
-  const errorsMatch = extracted.match(/(?:##\s*ERRORS?\s*FIXED|ERRORS_FIXED:)\s*([\s\S]*?)(?=\n##\s|$)/);
-  if (errorsMatch) {
-    const lines = errorsMatch[1].split('\n')
-      .filter((l: string) => l.trim().startsWith('-'))
-      .map((l: string) => l.replace(/^-\s*/, '').replace(/\*\*/g, '').trim())
-      .filter((l: string) => l.includes(':'));
+    // 3. Extract and upsert errors (frequency counter)
+    const errorsMatch = extracted.match(/(?:##\s*ERRORS?\s*FIXED|ERRORS_FIXED:)\s*([\s\S]*?)(?=\n##\s|$)/);
+    if (errorsMatch) {
+      const lines = errorsMatch[1].split('\n')
+        .filter((l: string) => l.trim().startsWith('-'))
+        .map((l: string) => l.replace(/^-\s*/, '').replace(/\*\*/g, '').trim())
+        .filter((l: string) => l.includes(':'));
 
-    for (const line of lines) {
-      const colonIdx = line.indexOf(':');
-      if (colonIdx > 0) {
-        const error = rejectPlaceholder(line.slice(0, colonIdx).trim());
-        if (!error) continue; // primary placeholder — skip
-        // Null out placeholder fixes so AssociativeRecall's `if (!r.fix)` skips
-        // the row during recall (the error pattern itself may still be useful).
-        const fix = rejectPlaceholder(line.slice(colonIdx + 1).trim());
+      for (const line of lines) {
+        const colonIdx = line.indexOf(':');
+        if (colonIdx > 0) {
+          const error = rejectPlaceholder(line.slice(0, colonIdx).trim());
+          if (!error) continue;
+          const fix = rejectPlaceholder(line.slice(colonIdx + 1).trim());
 
-        // Upsert: increment frequency if error exists, else insert
-        const existing = db.prepare('SELECT id, frequency FROM errors WHERE error = ?').get(error) as any;
-        if (existing) {
-          db.prepare('UPDATE errors SET frequency = frequency + 1, last_seen = CURRENT_TIMESTAMP, fix = ? WHERE id = ?')
-            .run(fix, existing.id);
-        } else {
-          db.prepare('INSERT INTO errors (created_at, error, fix) VALUES (?, ?, ?)').run(date, error, fix);
-          // NOTE: trigger handles FTS sync automatically
+          // Manual upsert — no UNIQUE constraint on errors.error yet
+          const existing = await db.queryOne<{ id: number }>('SELECT id FROM errors WHERE error = ?', [error]);
+          if (existing) {
+            await db.run(
+              'UPDATE errors SET frequency = frequency + 1, last_seen = CURRENT_TIMESTAMP, fix = COALESCE(?, fix) WHERE id = ?',
+              [fix, existing.id]
+            );
+          } else {
+            await db.run('INSERT INTO errors (created_at, error, fix) VALUES (?, ?, ?)', [date, error, fix]);
+          }
         }
       }
     }
-  }
 
-  db.close();
-  console.error(`[SessionExtract] DB: LoA entry + decisions + errors written`);
+    console.error(`[SessionExtract] DB: LoA entry + decisions + errors written [${db.backend}]`);
+  } finally {
+    await db.close();
+  }
 }
 
 // ─── Logging ───────────────────────────────────────────────────────
