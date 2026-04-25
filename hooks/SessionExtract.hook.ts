@@ -650,6 +650,19 @@ async function writeToDb(extracted: string, project: string, date: string, sessi
   const db = await openHookDb();
 
   try {
+    // 0. Ensure sessions row exists — loa_entries and decisions FK reference it
+    if (db.backend === 'postgres') {
+      await db.run(
+        `INSERT INTO sessions (session_id, project, summary) VALUES (?, ?, ?) ON CONFLICT (session_id) DO NOTHING`,
+        [sessionId, project, title]
+      );
+    } else {
+      await db.run(
+        `INSERT OR IGNORE INTO sessions (session_id, project, summary) VALUES (?, ?, ?)`,
+        [sessionId, project, title]
+      );
+    }
+
     // 1. Insert LoA entry (skip if session already recorded)
     const existingLoa = await db.queryOne<{ id: number }>('SELECT id FROM loa_entries WHERE session_id = ?', [sessionId]);
     if (!existingLoa) {
