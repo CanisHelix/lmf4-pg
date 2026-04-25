@@ -356,7 +356,15 @@ function appendErrors(fabricOutput: string, sessionLabel: string, timestamp: str
 
   let data: { patterns: any[]; meta?: any } = { patterns: [] };
   if (existsSync(ERRORS_PATH)) {
-    try { data = JSON.parse(readFileSync(ERRORS_PATH, 'utf-8')); } catch { data = { patterns: [] }; }
+    try {
+      const parsed = JSON.parse(readFileSync(ERRORS_PATH, 'utf-8'));
+      // StopFailure.hook.ts writes an array, but we expect { patterns: [] }
+      if (Array.isArray(parsed)) {
+        data.patterns = [];
+      } else if (parsed.patterns && Array.isArray(parsed.patterns)) {
+        data.patterns = parsed.patterns;
+      }
+    } catch { data = { patterns: [] }; }
   }
 
   const normalize = (s: string) => s.toLowerCase().replace(/['"]/g, '').replace(/\s+/g, ' ').trim();
