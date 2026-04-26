@@ -171,17 +171,13 @@ function wasAlreadyExtracted(convPath: string): boolean {
     const currentSize = statSync(convPath).size;
     const growth = (currentSize - record.size) / record.size;
 
-    if (record.permanentSkip) {
-      if (growth > 0.5) {
-        logExtract(`PERMANENT_SKIP_OVERRIDE: ${convPath} grew ${Math.round(growth * 100)}%, re-extracting`);
-        return false;
-      }
-      return true;
-    }
-
     if (growth > 0.5) {
       logExtract(`REGROWTH: ${convPath} grew ${Math.round(growth * 100)}%, re-extracting`);
       return false;
+    }
+
+    if (record.permanentSkip) {
+      return true;
     }
     if (record.failedAt && !record.extractedAt) {
       const retryTime = record.retryAfter ? new Date(record.retryAfter).getTime() : new Date(record.failedAt).getTime() + 86400000;
