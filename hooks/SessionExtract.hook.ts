@@ -172,8 +172,8 @@ function wasAlreadyExtracted(convPath: string): boolean {
     const growth = (currentSize - record.size) / record.size;
 
     if (record.permanentSkip) {
-      if (growth > 1.0) {
-        logExtract(`PERMANENT_SKIP_OVERRIDE: ${convPath} doubled in size, re-extracting`);
+      if (growth > 0.5) {
+        logExtract(`PERMANENT_SKIP_OVERRIDE: ${convPath} grew ${Math.round(growth * 100)}%, re-extracting`);
         return false;
       }
       return true;
