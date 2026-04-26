@@ -46,6 +46,12 @@ const REJECTIONS_PATH = join(MEMORY_DIR, 'REJECTIONS.log');
 const ERRORS_PATH = join(MEMORY_DIR, 'ERROR_PATTERNS.json');
 const PROJECTS_DIR = join(process.env.HOME!, '.claude', 'projects');
 const DEDUP_DB_PATH = join(MEMORY_DIR, '.extraction_tracker.json');
+const DEBUG_ARCHIVE_DIR = join(process.env.HOME!, '.claude', 'conversation-debug');
+const DEBUG_ARCHIVE_PATH = join(DEBUG_ARCHIVE_DIR, 'extract-archive.jsonl');
+
+type DebugMode = 'record' | 'replay' | null;
+let debugMode: DebugMode = null;
+let debugReplayMap: Map<string, string> = new Map();
 
 const HOT_RECALL_MAX_SESSIONS = 10;
 const EXTRACT_PROMPT_PATH = join(MEMORY_DIR, 'extract_prompt.md');
@@ -497,6 +503,35 @@ async function extractWithClaude(messages: string): Promise<string | null> {
   }
 }
 
+// ─── Debug record/replay wrapper ──────────────────────────────────
+
+async function extractWithDebug(messages: string, convId: string, convPath: string): Promise<string | null> {
+  if (debugMode === 'replay') {
+    const cached = debugReplayMap.get(convId);
+    if (cached) {
+      console.error(`[SessionExtract] DEBUG REPLAY: using cached response for ${convId}`);
+      return cached;
+    }
+    console.error(`[SessionExtract] DEBUG REPLAY: no archive entry for ${convId}, skipping`);
+    return null;
+  }
+
+  const result = await extractWithClaude(messages);
+
+  if (debugMode === 'record' && result) {
+    try {
+      mkdirSync(DEBUG_ARCHIVE_DIR, { recursive: true });
+      const entry = JSON.stringify({ convId, convPath, response: result, timestamp: new Date().toISOString() });
+      appendFileSync(DEBUG_ARCHIVE_PATH, entry + '\n', 'utf-8');
+      console.error(`[SessionExtract] DEBUG RECORD: archived ${convId}`);
+    } catch (e: any) {
+      console.error(`[SessionExtract] DEBUG RECORD: archive write failed: ${e.message}`);
+    }
+  }
+
+  return result;
+}
+
 /**
  * Chunked extraction for large conversations
  */
@@ -558,13 +593,18 @@ async function extractAndAppend(conversationPath: string, cwd: string): Promise<
       return;
     }
 
+    const convId = conversationPath.split('/').pop()?.replace('.jsonl', '') || 'unknown';
     let extracted: string = "";
 
     if (messages.length > 60000) {
+      if (debugMode) {
+        console.error(`[SessionExtract] DEBUG: skipping chunked conversation ${convId}`);
+        return;
+      }
       const chunkedResult = await extractChunked(messages);
       if (chunkedResult) extracted = chunkedResult;
     } else {
-      const result = await extractWithClaude(messages);
+      const result = await extractWithDebug(messages, convId, conversationPath);
       if (result) extracted = result;
     }
 
@@ -846,6 +886,87 @@ if (process.argv.includes('--batch')) {
     console.error('Usage: bun SessionExtract.hook.ts --reextract <conversation.jsonl> [cwd]');
     process.exit(1);
   }
+// --debug-record: Run real haiku on up to 5 conversations and archive responses
+} else if (process.argv.includes('--debug-record')) {
+  debugMode = 'record';
+  const force = process.argv.includes('--force');
+  const MAX_RECORD = 5;
+  console.error(`[SessionExtract] DEBUG RECORD: will process up to ${MAX_RECORD} conversations`);
+  logExtract(`DEBUG RECORD: start (force=${force})`);
+
+  const allConvs: Array<{ path: string; cwd: string }> = [];
+  if (existsSync(PROJECTS_DIR)) {
+    for (const projDir of readdirSync(PROJECTS_DIR)) {
+      const projPath = join(PROJECTS_DIR, projDir);
+      try {
+        if (!statSync(projPath).isDirectory()) continue;
+        const cwd = '/' + projDir.replace(/^-/, '').replace(/-/g, '/');
+        for (const f of readdirSync(projPath)) {
+          if (f.endsWith('.jsonl') && !f.startsWith('agent-')) {
+            allConvs.push({ path: join(projPath, f), cwd });
+          }
+        }
+      } catch { continue; }
+    }
+  }
+
+  (async () => {
+    let recorded = 0;
+    for (const conv of allConvs) {
+      if (recorded >= MAX_RECORD) break;
+      if (isExtractionArtifact(conv.path)) continue;
+      if (!force && wasAlreadyExtracted(conv.path)) continue;
+      if (force) {
+        try { const t = loadExtractionTracker(); delete t[conv.path]; saveExtractionTracker(t); } catch {}
+      }
+      console.error(`[SessionExtract] DEBUG RECORD: processing ${conv.path.split('/').pop()} (${recorded + 1}/${MAX_RECORD})`);
+      await extractAndAppend(conv.path, conv.cwd);
+      recorded++;
+      if (recorded < MAX_RECORD) await new Promise(r => setTimeout(r, 3000));
+    }
+    console.error(`[SessionExtract] DEBUG RECORD: done. Recorded ${recorded} conversations to ${DEBUG_ARCHIVE_PATH}`);
+    logExtract(`DEBUG RECORD: done. recorded=${recorded}`);
+    process.exit(0);
+  })();
+
+// --debug-replay: Replay archived responses through the full pipeline (no API calls)
+} else if (process.argv.includes('--debug-replay')) {
+  debugMode = 'replay';
+  if (!existsSync(DEBUG_ARCHIVE_PATH)) {
+    console.error(`[SessionExtract] DEBUG REPLAY: no archive at ${DEBUG_ARCHIVE_PATH} — run --debug-record first`);
+    process.exit(1);
+  }
+
+  const archiveEntries: Array<{ convId: string; convPath: string; cwd?: string }> = [];
+  for (const line of readFileSync(DEBUG_ARCHIVE_PATH, 'utf-8').trim().split('\n')) {
+    try {
+      const entry = JSON.parse(line);
+      debugReplayMap.set(entry.convId, entry.response);
+      archiveEntries.push({ convId: entry.convId, convPath: entry.convPath, cwd: entry.cwd });
+    } catch {}
+  }
+
+  console.error(`[SessionExtract] DEBUG REPLAY: loaded ${debugReplayMap.size} entries from archive`);
+  logExtract(`DEBUG REPLAY: start, entries=${debugReplayMap.size}`);
+
+  (async () => {
+    try {
+      const tracker = loadExtractionTracker();
+      for (const e of archiveEntries) { delete tracker[e.convPath]; }
+      saveExtractionTracker(tracker);
+    } catch {}
+
+    for (const entry of archiveEntries) {
+      const cwd = entry.cwd || process.cwd();
+      console.error(`[SessionExtract] DEBUG REPLAY: replaying ${entry.convId}`);
+      await extractAndAppend(entry.convPath, cwd);
+      await new Promise(r => setTimeout(r, 500));
+    }
+    console.error(`[SessionExtract] DEBUG REPLAY: done`);
+    logExtract(`DEBUG REPLAY: done`);
+    process.exit(0);
+  })();
+
 // --extract: Background extraction mode (spawned by main hook)
 } else if (process.argv.includes('--extract')) {
   const idx = process.argv.indexOf('--extract');
