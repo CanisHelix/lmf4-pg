@@ -78,6 +78,8 @@ interface ExtractionRecord {
   extractedAt?: string;
   failedAt?: string;
   retryAfter?: string;
+  permanentSkip?: boolean;
+  skipReason?: string;
 }
 
 // ─── Ensure memory directories exist ───────────────────────────────
@@ -169,6 +171,15 @@ function wasAlreadyExtracted(convPath: string): boolean {
   try {
     const currentSize = statSync(convPath).size;
     const growth = (currentSize - record.size) / record.size;
+
+    if (record.permanentSkip) {
+      if (growth > 1.0) {
+        logExtract(`PERMANENT_SKIP_OVERRIDE: ${convPath} doubled in size, re-extracting`);
+        return false;
+      }
+      return true;
+    }
+
     if (growth > 0.5) {
       logExtract(`REGROWTH: ${convPath} grew ${Math.round(growth * 100)}%, re-extracting`);
       return false;
@@ -202,6 +213,14 @@ function markAsFailed(convPath: string): void {
       failedAt: now.toISOString(),
       retryAfter: new Date(now.getTime() + 86400000).toISOString()
     };
+    saveExtractionTracker(tracker);
+  } catch {}
+}
+
+function markAsPermanentSkip(convPath: string, reason: string): void {
+  try {
+    const tracker = loadExtractionTracker();
+    tracker[convPath] = { size: statSync(convPath).size, permanentSkip: true, skipReason: reason };
     saveExtractionTracker(tracker);
   } catch {}
 }
@@ -538,7 +557,8 @@ async function extractAndAppend(conversationPath: string, cwd: string): Promise<
 
     const messages = extractMessages(conversationPath);
     if (messages.length < 500) {
-      console.error('[SessionExtract] Conversation too short, skipping');
+      console.error('[SessionExtract] Conversation too short, permanently skipping');
+      markAsPermanentSkip(conversationPath, 'too_short');
       return;
     }
 
@@ -560,10 +580,10 @@ async function extractAndAppend(conversationPath: string, cwd: string): Promise<
     }
 
     // Quality gate
-    if (!extracted.includes('ONE SENTENCE SUMMARY') && !extracted.includes('MAIN IDEAS')) {
-      console.error("[SessionExtract] QUALITY GATE FAILED");
-      logExtract("QUALITY GATE FAILED");
-      markAsFailed(conversationPath);
+    if (!extracted.includes('## ONE SENTENCE SUMMARY') && !extracted.includes('## MAIN IDEAS')) {
+      console.error("[SessionExtract] QUALITY GATE FAILED — permanently skipping");
+      logExtract("QUALITY GATE FAILED: permanently skipped");
+      markAsPermanentSkip(conversationPath, 'quality_gate');
       return;
     }
 
