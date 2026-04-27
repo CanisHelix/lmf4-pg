@@ -224,9 +224,10 @@ function isExtractionArtifact(convPath: string): boolean {
   try {
     const firstLine = readFileSync(convPath, 'utf-8').trim().split('\n')[0];
     const entry = JSON.parse(firstLine);
-    const text = extractTextFromContent(entry?.message?.content ?? '');
-    return text.includes('Extract ONLY what actually happened') ||
-           text.includes('expert at extracting meaningful, factual information') ||
+    const text = extractTextFromContent(entry?.content ?? '');
+    return (text.startsWith('# IDENTITY and PURPOSE\n\nYou are an expert at extracting meaningful, factual information from AI coding session transcripts.') ||
+           text.startsWith('# IDENTITY and PURPOSE You are an expert at extracting meaningful, factual information from AI coding session transcripts.')) &&
+           text.includes('Follow this format EXACTLY.') &&
            text.includes('## ONE SENTENCE SUMMARY');
   } catch {
     return false;
@@ -793,13 +794,14 @@ if (process.argv.includes('--batch')) {
         } catch {}
       }
 
-      if (isExtractionArtifact(conv.path)) {
-        markAsExtracted(conv.path);
+      if (!force && wasAlreadyExtracted(conv.path)) {
         skipped++;
         continue;
       }
 
-      if (!force && wasAlreadyExtracted(conv.path)) {
+      if (isExtractionArtifact(conv.path)) {
+        console.error('[SessionExtract] Extraction Artifact, permanently skipping');
+        markAsPermanentSkip(conv.path, 'extraction_artifact');
         skipped++;
         continue;
       }
